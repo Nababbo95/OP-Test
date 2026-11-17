@@ -1,0 +1,436 @@
+<!DOCTYPE html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OPDeck Lab v2.4</title><style>
+:root{--bg:#f6f7f9;--sf:#fff;--tx:#14171c;--mu:#5d6673;--bd:#dde1e7;--ac:#c8352b;--ok:#1b8a4b;--wr:#b7791f}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1218;--sf:#181d26;--tx:#e8ebf0;--mu:#97a1b0;--bd:#2a3140;--ac:#ef5a4e;--ok:#3ecf7a;--wr:#e5b04a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px system-ui,sans-serif}
+header{display:flex;gap:4px;flex-wrap:wrap;align-items:center;padding:8px 12px;background:var(--sf);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:5}
+header b{color:var(--ac);margin-right:10px}nav button{background:none;border:0;color:var(--mu);padding:7px 10px;border-radius:6px;cursor:pointer;font:inherit}
+nav button.on{background:var(--ac);color:#fff}main{max-width:1200px;margin:0 auto;padding:14px}
+.card{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:12px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.lead{cursor:pointer;border:1px solid var(--bd);border-radius:8px;padding:6px;background:var(--sf)}.lead.sel{outline:2px solid var(--ac)}
+.lead img{width:100%;border-radius:4px}.lead small{color:var(--mu)}
+input,select,button.b{font:inherit;padding:6px 9px;border:1px solid var(--bd);border-radius:6px;background:var(--sf);color:var(--tx)}
+button.b{cursor:pointer}button.p{background:var(--ac);color:#fff;border-color:var(--ac)}
+table{width:100%;border-collapse:collapse}td,th{padding:4px 6px;border-bottom:1px solid var(--bd);text-align:left}
+.wrap{overflow-x:auto}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:800px){.two{grid-template-columns:1fr}}
+.e{color:var(--ac)}.w{color:var(--wr)}.o{color:var(--ok)}.mu{color:var(--mu)}.tag{font-size:11px;padding:1px 6px;border-radius:9px;border:1px solid var(--bd);color:var(--mu)}
+.bar{display:inline-block;background:var(--ac);height:10px;border-radius:2px;vertical-align:middle}
+.chip{display:inline-block;border:1px solid var(--bd);border-radius:6px;padding:3px 6px;margin:2px;cursor:pointer;background:var(--bg);font-size:12px}.chip.on{outline:2px solid var(--ac)}.chip.rs{opacity:.65}
+</style></head><body>
+<header><b>OPDeck Lab</b><nav id="nav"></nav></header><main id="m"></main>
+<script>
+/* OPDeck engine 0.5.0-ref (porting JS di engine.py/effects.py/sim.py). Regole base + DSL; effetti non coperti => carta NON implementata. */
+const ENGINE_VERSION="0.7.0-ref";
+class Rng{constructor(s){this.x=BigInt.asUintN(64,BigInt(s))}
+ next(){this.x=BigInt.asUintN(64,this.x+0x9E3779B97F4A7C15n);let z=this.x;z=BigInt.asUintN(64,(z^(z>>30n))*0xBF58476D1CE4E5B9n);z=BigInt.asUintN(64,(z^(z>>27n))*0x94D049BB133111EBn);return z^(z>>31n)}
+ below(n){return Number((this.next()*BigInt(n))>>64n)}
+ shuffle(l){for(let i=l.length-1;i>0;i--){const j=this.below(i+1);[l[i],l[j]]=[l[j],l[i]]}}}
+const maxBy=(a,f)=>a.reduce((b,x)=>f(x)>f(b)?x:b),minBy=(a,f)=>a.reduce((b,x)=>f(x)<f(b)?x:b);
+const rm=(a,x)=>{const i=a.indexOf(x);if(i>=0)a.splice(i,1)};
+class Unit{constructor(d,tp=0){this.d=d;this.rested=false;this.don=0;this.tp=tp;this.bonus=0}}
+class Player{constructor(l,deck){this.leader=new Unit(l);this.deck=[...deck];this.hand=[];this.life=[];this.trash=[];this.field=[];this.donDeck=10;this.act=0;this.rst=0;this.seen=new Set()}
+ donOnField(){return this.act+this.rst+this.leader.don+this.field.reduce((a,u)=>a+u.don,0)}}
+const cval=c=>c.type==="CHARACTER"?c.counter:c.effects.filter(e=>e.trigger==="counter"&&e.action==="power_battle").reduce((a,e)=>a+e.n,0);
+const Heuristic={
+ mulligan:h=>h.filter(c=>c.type==="CHARACTER"&&c.cost<=3).length<2,
+ useful(g,p,c){const P=g.pl[p],O=g.pl[1-p];for(const e of c.effects){if(e.trigger!=="main")continue;
+  if(e.action==="ko_opp"&&!O.field.some(u=>u.d.cost<=e.max_cost))return false;
+  if(e.action==="ko_opp_power"&&!O.field.some(u=>u.d.power<=e.max_power))return false;
+  if(e.action==="draw"&&P.deck.length<=e.n)return false;
+  if(e.action==="rest_opp"&&!O.field.some(u=>!u.rested&&u.d.cost<=e.max_cost))return false;
+  if(e.action==="ko_opp_rested"&&!O.field.some(u=>u.rested&&u.d.cost<=e.max_cost))return false;
+  if(e.action==="power_turn"&&!(g.attacksAllowed()&&!P.leader.rested))return false}return true},
+ main(g,p){const P=g.pl[p],O=g.pl[1-p];
+  for(const c of [...P.hand].sort((a,b)=>(b.cost-a.cost)||(b.power-a.power))){
+   if(c.type!=="CHARACTER"||c.cost>P.act||P.hand.indexOf(c)<0)continue;
+   if(P.field.length>=5){const w=minBy(P.field,u=>u.d.power);if(c.power<=w.d.power)continue;g.trashUnit(P,w)}
+   g.playCharacter(p,c);if(g.winner!==null)return}
+  const evs=P.hand.filter(c=>c.type==="EVENT"&&c.effects.some(e=>e.trigger==="main"));
+  for(const c of evs.sort((a,b)=>b.cost-a.cost)){if(c.cost<=P.act&&P.hand.indexOf(c)>=0&&this.useful(g,p,c)){g.playEvent(p,c);if(g.winner!==null)return}}
+  if(!g.attacksAllowed())return;
+  for(const u of [P.leader,...P.field].sort((a,b)=>b.d.power-a.d.power)){
+   if(!g.canAttack(P,u))continue;
+   const pw=g.power(u,true),room=P.act*1000,lead=O.leader,lp=g.power(lead,false);
+   const kills=O.field.filter(x=>x.rested&&pw+room>=g.power(x,false)),faceOk=pw+room>=lp;let tgt;
+   if(faceOk&&O.life.length<=2)tgt=lead;else if(kills.length)tgt=maxBy(kills,x=>x.d.cost*1e6+x.d.power);else if(faceOk)tgt=lead;else continue;
+   const need=Math.max(0,Math.ceil((g.power(tgt,false)-pw)/1000)),extra=tgt===lead?Math.min(P.act-need,2):0;
+   g.attachDon(P,u,need+Math.max(0,extra));g.attack(p,u,tgt);if(g.winner!==null)return}},
+ block(g,d,apw,tgt,bl){if(tgt!==g.pl[d].leader||!bl.length)return null;
+  if(g.pl[d].life.length<=1)return minBy(bl,u=>u.d.power);
+  const ok=bl.filter(u=>u.d.power>apw);return ok.length?minBy(ok,u=>u.d.power):null},
+ counter(g,d,apw,tgt,tpw){const P=g.pl[d],deficit=apw-tpw+1;if(deficit<=0)return[];
+  const cs=P.hand.filter(c=>(c.type==="CHARACTER"&&c.counter>0)||(c.type==="EVENT"&&cval(c)>0&&c.cost<=P.act)),one=cs.filter(c=>cval(c)>=deficit);
+  let pick=one.length?[minBy(one,c=>cval(c)*100+c.cost)]:[];
+  if(!pick.length){let tot=0,budget=P.act;for(const c of [...cs].sort((a,b)=>(cval(b)-cval(a))||(a.cost-b.cost))){
+    if(c.type==="EVENT"){if(c.cost>budget)continue;budget-=c.cost}pick.push(c);tot+=cval(c);if(tot>=deficit)break}if(tot<deficit)return[]}
+  if(tgt===P.leader)return(P.life.length<=2||pick.length===1)?pick:[];
+  return(tgt.d.cost>=4&&pick.length===1)?pick:[]}};
+class Game{
+ constructor(leaders,decks,seed,first=0,pol=[Heuristic,Heuristic]){this.rng=new Rng(seed);this.first=first;this.t=0;this.winner=null;this.reason=null;this.pol=pol;
+  this.pl=[0,1].map(i=>new Player(leaders[i],decks[i]));for(const P of this.pl)this.rng.shuffle(P.deck);for(const P of this.pl)this.draw(P,5);
+  for(const i of [first,1-first]){const P=this.pl[i];if(this.pol[i].mulligan(P.hand)){P.deck.push(...P.hand);P.hand=[];this.rng.shuffle(P.deck);this.draw(P,5)}}
+  for(const P of this.pl)P.seen=new Set(P.hand.map(c=>c.id));for(const P of this.pl)for(let k=0;k<P.leader.d.life;k++)P.life.push(P.deck.shift())}
+ draw(P,n=1){for(let i=0;i<n;i++){const c=P.deck.shift();P.hand.push(c);if(c)P.seen.add(c.id)}}
+ attacksAllowed(){return this.t>2}
+ power(u,mine){return u.d.power+(mine?1000*u.don:0)+u.bonus}
+ canAttack(P,u){return !u.rested&&(u===P.leader||u.tp<this.t||u.d.rush)}
+ trashUnit(P,u){rm(P.field,u);P.trash.push(u.d);P.rst+=u.don;u.don=0}
+ playCharacter(p,c){const P=this.pl[p];P.act-=c.cost;P.rst+=c.cost;rm(P.hand,c);P.field.push(new Unit(c,this.t));this.fire(p,c,"on_play")}
+ playEvent(p,c){const P=this.pl[p];P.act-=c.cost;P.rst+=c.cost;rm(P.hand,c);this.fire(p,c,"main");P.trash.push(c)}
+ attachDon(P,u,n){n=Math.min(n,P.act);P.act-=n;u.don+=n}
+ fire(p,d,trig,unit=null){const P=this.pl[p],O=this.pl[1-p];
+  for(const e of d.effects){if(e.trigger!==trig||this.winner!==null)continue;if(e.min_don&&(unit===null||unit.don<e.min_don))continue;
+   if(e.action==="draw"){for(let i=0;i<e.n;i++){if(!P.deck.length){this.winner=1-p;this.reason="deck";return}this.draw(P)}}
+   else if(e.action==="don_add"){const n=Math.min(e.n,P.donDeck,10-P.donOnField());P.donDeck-=n;if(e.mode==="rest")P.rst+=n;else P.act+=n}
+   else if(e.action==="rest_opp"){const t=O.field.filter(u=>!u.rested&&u.d.cost<=e.max_cost);if(t.length)maxBy(t,u=>u.d.cost*1e6+u.d.power).rested=true}
+   else if(e.action==="ko_opp_rested"){const t=O.field.filter(u=>u.rested&&u.d.cost<=e.max_cost);if(t.length)this.trashUnit(O,maxBy(t,u=>u.d.cost*1e6+u.d.power))}
+   else if(e.action==="power_turn")P.leader.bonus+=e.n
+   else if(e.action==="ko_opp"||e.action==="ko_opp_power"){const t=O.field.filter(u=>e.action==="ko_opp"?u.d.cost<=e.max_cost:u.d.power<=e.max_power);
+    if(t.length)this.trashUnit(O,maxBy(t,u=>u.d.cost*1e6+u.d.power))}}}
+ turn(p){const P=this.pl[p];for(const u of [P.leader,...P.field]){P.rst+=u.don;u.don=0;u.rested=false}P.act+=P.rst;P.rst=0;
+  if(this.t>1){if(!P.deck.length){this.winner=1-p;this.reason="deck";return}this.draw(P)}
+  const n=Math.min(this.t===1?1:2,P.donDeck,10-P.donOnField());P.donDeck-=n;P.act+=n;this.pol[p].main(this,p);for(const Q of this.pl)for(const u of [Q.leader,...Q.field])u.bonus=0}
+ attack(p,atk,tgt){const D=this.pl[1-p];atk.rested=true;this.fire(p,atk.d,"when_attacking",atk);if(this.winner!==null)return;
+  if(tgt!==D.leader&&D.field.indexOf(tgt)<0)return;const apw=this.power(atk,true);
+  const bl=D.field.filter(u=>u.d.blocker&&!u.rested),b=this.pol[1-p].block(this,1-p,apw,tgt,bl);if(b){b.rested=true;tgt=b}
+  let tpw=this.power(tgt,false);for(const c of this.pol[1-p].counter(this,1-p,apw,tgt,tpw)){rm(D.hand,c);D.trash.push(c);if(c.type==="EVENT"){D.act-=c.cost;D.rst+=c.cost}tpw+=cval(c)}
+  if(apw<tpw)return;
+  if(tgt===D.leader){for(let i=0;i<(atk.d.double_attack?2:1);i++){if(!D.life.length){this.winner=p;this.reason="life";return}
+    const c=D.life.shift();if(atk.d.banish)D.trash.push(c);
+    else if(c.effects.some(e=>e.trigger==="trigger")){this.fire(1-p,c,"trigger");D.trash.push(c);if(this.winner!==null)return}else D.hand.push(c)}}
+  else{rm(D.field,tgt);D.trash.push(tgt.d);D.rst+=tgt.don;tgt.don=0}}
+ run(max=200){let p=this.first;while(this.winner===null&&this.t<max){this.t++;this.turn(p);p=1-p}if(this.winner===null)this.reason="turn_limit";return this.winner}}
+/* ---- DSL effetti (port di effects.py) ---- */
+const Q="['’]",FXHEAD=/^(?:\[DON!! x(\d+)\] )?\[(On Play|When Attacking|Trigger|Main|Counter)\] /,TRIG={"On Play":"on_play","When Attacking":"when_attacking","Trigger":"trigger","Main":"main","Counter":"counter"},KW={"Blocker":"blocker","Rush":"rush","Double Attack":"double_attack","Banish":"banish"};
+const eff=(o)=>({n:0,max_cost:0,mode:"",min_don:0,max_power:0,...o});
+const FXACT=[[/^Draw (\d+) cards?\./,m=>({action:"draw",n:+m[1]})],
+ [/^Add up to (\d+) DON!! cards? from your DON!! deck and set (?:it|them) as active\./,m=>({action:"don_add",n:+m[1],mode:"active"})],
+ [/^Add up to (\d+) DON!! cards? from your DON!! deck and rest (?:it|them)\./,m=>({action:"don_add",n:+m[1],mode:"rest"})],
+ [new RegExp(`^K\\.O\\. up to 1 of your opponent${Q}s Characters with a cost of (\\d+) or less\\.`),m=>({action:"ko_opp",max_cost:+m[1]})],
+ [new RegExp(`^K\\.O\\. up to 1 of your opponent${Q}s Characters with (\\d+) power or less\\.`),m=>({action:"ko_opp_power",max_power:+m[1]})]];
+FXACT.push([/^Up to 1 of your Leader or Character cards gains \+(\d+) power during this turn\./,m=>({action:"power_turn",n:+m[1]})],
+ [/^Up to 1 of your Leader or Character cards gains \+(\d+) power during this battle\./,m=>({action:"power_battle",n:+m[1]})],
+ [new RegExp(`^Rest up to 1 of your opponent${Q}s Characters with a cost of (\\d+) or less\\.`),m=>({action:"rest_opp",max_cost:+m[1]})],
+ [new RegExp(`^K\\.O\\. up to 1 of your opponent${Q}s rested Characters with a cost of (\\d+) or less\\.`),m=>({action:"ko_opp_rested",max_cost:+m[1]})]);
+const fxNorm=t=>(t||"").replace(/This card has been officially errata'd\./g,"").replace(/Under the rules of this game, you may have any number of this card in your deck\./g,"").replace(/\([^)]*\)/g,"").split(/\s+/).filter(Boolean).join(" ");
+function fxParse(text){let t=fxNorm(text);const kws=new Set(),effs=[];
+ outer:while(t){let m=t.match(/^\[(Blocker|Rush|Double Attack|Banish)\]\s*/);if(m){kws.add(KW[m[1]]);t=t.slice(m[0].length);continue}
+  const h=t.match(FXHEAD);if(h&&!(h[1]&&h[2]!=="When Attacking")){const rest=t.slice(h[0].length);
+   for(const[rx,f]of FXACT){const a=rest.match(rx);if(a){const kw=f(a);if((h[2]==="Counter")!==(kw.action==="power_battle"))continue;effs.push(eff({trigger:TRIG[h[2]],min_don:+(h[1]||0),...kw}));t=rest.slice(a[0].length).replace(/^\s+/,"");continue outer}}}
+  break}
+ return{kws,effs,rest:t}}
+function fxResolve(card){const{kws,effs,rest}=fxParse(card.text);if(!fxNorm(card.text))return{kws:new Set(),effs:[],ok:true,src:"vanilla"};
+ return rest?{kws:new Set(),effs:[],ok:false,src:"none"}:{kws,effs,ok:true,src:"auto"}}
+function buildDeck(cards,leader,main){const memo={};const d=n=>memo[n]||(memo[n]=(c=>{const r=fxResolve(c);return{id:c.card_number,type:c.type,cost:c.cost||0,power:c.power||0,counter:c.counter||0,life:c.life||0,
+  blocker:r.kws.has("blocker"),rush:r.kws.has("rush"),double_attack:r.kws.has("double_attack"),banish:r.kws.has("banish"),implemented:r.ok&&!(c.type==="LEADER"&&!(c.life>=1&&c.life<=10)),effects:r.effs}})(cards[n]));
+ return{leader:d(leader),main:Object.entries(main).flatMap(([k,q])=>Array(q).fill(d(k)))}}
+/* ---- runner (port di sim.py) ---- */
+function wilson(w,n,z=1.96){if(!n)return[0,1];const p=w/n,den=1+z*z/n,c=p+z*z/(2*n),r=z*Math.sqrt(p*(1-p)/n+z*z/(4*n*n));return[(c-r)/den,(c+r)/den]}
+const unimpl=(...ds)=>[...new Set(ds.flatMap(d=>[d.leader,...d.main]).filter(c=>!c.implemented).map(c=>c.id))].sort();
+function newRun(a,b,seed){return{a,b,seed,i:0,wins:[0,0],draws:0,af:[0,0],as:[0,0],turns:0,reasons:{},cs:{}}}
+function stepRun(r,k){const end=r.i+k;for(;r.i<end;r.i++){const f=r.i%2,g=new Game([r.a.leader,r.b.leader],[r.a.main,r.b.main],new Rng(BigInt(r.seed)+BigInt(r.i)).next(),f),w=g.run();
+ r.turns+=g.t;r.reasons[g.reason]=(r.reasons[g.reason]||0)+1;const s=f===0?r.af:r.as;s[0]++;
+ if(w===null)r.draws++;else{r.wins[w]++;if(w===0)s[1]++}for(const id of g.pl[0].seen){const e=r.cs[id]||(r.cs[id]=[0,0]);e[0]++;if(w===0)e[1]++}}}
+function summarize(r,n){const bad=unimpl(r.a,r.b),[lo,hi]=wilson(r.wins[0],n);return{engine:ENGINE_VERSION,seed:r.seed,n,wins_a:r.wins[0],wins_b:r.wins[1],draws:r.draws,winrate_a:r.wins[0]/n,ci95_a:[lo,hi],avg_turns:r.turns/n,end_reasons:r.reasons,
+ a_first:{games:r.af[0],wins:r.af[1]},a_second:{games:r.as[0],wins:r.as[1]},partial:bad.length>0,unimplemented:bad}}
+
+/* ---- legalita, suite di matchup, contributo carte, ottimizzatore ---- */
+function legalDeck(cards,ban,lid,main){const L=cards[lid],E=[];if(!L)return["leader"];
+ if(Object.values(main).reduce((a,b)=>a+b,0)!==50)E.push("size");
+ for(const[k,q]of Object.entries(main)){const c=cards[k];if(!c){E.push("unknown "+k);continue}if(c.type==="LEADER")E.push("leader "+k);if(q>c.max)E.push("copies "+k);if(!c.colors.some(x=>L.colors.includes(x)))E.push("color "+k)}
+ for(const b of ban){const has=x=>x in main||x===lid;if(b.kind==="ban"&&has(b.card_number))E.push("ban "+b.card_number);else if(b.kind==="limit"&&(main[b.card_number]||0)>b.limit_n)E.push("limit "+b.card_number);else if(b.kind==="pair"&&has(b.card_number)&&has(b.other_number))E.push("pair "+b.card_number)}
+ return E}
+const wts=res=>{const w=res.map(x=>Math.max(0,+x.o.weight||0)),t=w.reduce((a,b)=>a+b,0);return t?w.map(x=>x/t):w.map(()=>1/w.length)};
+const score=res=>{const w=wts(res);return res.reduce((a,x,i)=>a+w[i]*x.s.winrate_a,0)};
+const scoreSE=res=>{const w=wts(res);return Math.sqrt(res.reduce((a,x,i)=>{const p=x.s.winrate_a;return a+w[i]*w[i]*p*(1-p)/x.s.n},0))};
+async function runSuite(cards,deckA,opps,n,seed,tick){const A=buildDeck(cards,deckA.leader,deckA.cards),res=[];
+ for(let oi=0;oi<opps.length;oi++){const o=opps[oi],B=buildDeck(cards,o.leader,o.cards),r=newRun(A,B,seed+oi*7919);
+  while(r.i<n){stepRun(r,Math.min(100,n-r.i));if(tick)await tick(oi,r.i)}
+  res.push({o,r,s:summarize(r,n)})}
+ return res}
+function contrib(runs){const N=runs.reduce((a,r)=>a+r.i,0),W=runs.reduce((a,r)=>a+r.wins[0],0),m={};
+ for(const r of runs)for(const[id,[g,w]]of Object.entries(r.cs)){const e=m[id]||(m[id]=[0,0]);e[0]+=g;e[1]+=w}
+ return Object.entries(m).filter(([,[g]])=>g>=30&&N-g>=30).map(([id,[g,w]])=>({id,g,wr1:w/g,wr0:(W-w)/(N-g),d:w/g-(W-w)/(N-g)})).sort((a,b)=>b.d-a.d)}
+async function optimize(cards,ban,deck,opps,o,tick,log){
+ const L=cards[deck.leader],rng=new Rng(o.seed+99),seen=new Set(),moves=[];
+ const pool=Object.values(cards).filter(c=>(c.type==="CHARACTER"||c.type==="EVENT")&&c.colors.some(x=>L.colors.includes(x))&&fxResolve(c).ok).map(c=>c.card_number);
+ if(!pool.length)throw new Error("nessuna carta candidata implementata per questo Leader");
+ const ev=async(m,seed,n)=>{const rs=await runSuite(cards,{leader:deck.leader,cards:m},opps,n,seed,tick);return{rs,sc:score(rs)}};
+ let cur={...deck.cards},base=await ev(cur,o.seed,o.n),fails=0;seen.add(JSON.stringify(Object.entries(cur).sort()));
+ for(let round=1;round<=o.rounds&&fails<2;round++){
+  try{
+   const dl={};for(const x of contrib(base.rs.map(x=>x.r)))dl[x.id]=x.d;
+   const outs=Object.keys(cur).sort((a,b)=>(dl[a]??0)-(dl[b]??0)).slice(0,10);
+   let best=null,j=0;
+   for(let t=0;j<o.k&&t<o.k*10;t++){
+    const out=outs[rng.below(outs.length)],inn=pool[rng.below(pool.length)];
+    if(inn===out)continue;
+    const m={...cur};m[out]--;if(!m[out])delete m[out];m[inn]=(m[inn]||0)+1;
+    const key=JSON.stringify(Object.entries(m).sort());
+    if(seen.has(key)||legalDeck(cards,ban,deck.leader,m).length)continue;
+    seen.add(key);j++;log&&log(`Ciclo ${round}/${o.rounds} · candidato ${j}/${o.k}`);
+    const c=await ev(m,o.seed,o.n);if(!best||c.sc>best.sc)best={...c,m,out,inn}}
+   let ok=false;
+   if(best&&best.sc>base.sc){log&&log(`Ciclo ${round}/${o.rounds} · conferma su campione indipendente`);const s2=o.seed+1000003,a=await ev(cur,s2,o.n),b=await ev(best.m,s2,o.n);
+    if(b.sc>a.sc){moves.push({round,out:best.out,inn:best.inn,before:base.sc,after:best.sc,vb:a.sc,va:b.sc});cur=best.m;base=best;ok=true}}
+   fails=ok?0:fails+1}
+  catch(e){if(e!=="stop")throw e;o.reset&&o.reset();break}}
+ log&&log("Misura finale su partite indipendenti…");
+ const hs=o.seed+7777777,hn=o.n*3,orig=await ev(deck.cards,hs,hn),opt=moves.length?await ev(cur,hs,hn):orig;
+ return{orig,opt,moves,final:cur,hn,seed:hs}}
+if(typeof module!=="undefined")module.exports={Rng,Game,Heuristic,fxParse,fxResolve,buildDeck,newRun,stepRun,summarize,unimpl,legalDeck,runSuite,contrib,optimize,score,scoreSE,wts};
+
+</script>
+<script>
+const $=s=>document.querySelector(s),T=[["dash","Dashboard"],["lead","Leader"],["meta","Meta"],["build","Deck Builder"],["sim","Simulatore"],["opt","Ottimizzazione AI"],["stats","Statistiche"],["db","Database carte"],["cov","Copertura effetti"],["pt","Playtest solo"]];
+const ld=(k,d)=>{try{return JSON.parse(localStorage.getItem(k))??d}catch{return d}},sv=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){alert("Salvataggio locale fallito: "+e.message)}};
+const S={cards:ld("cards",{}),info:ld("info",null),ban:ld("ban",[]),meta:ld("meta",[]),saved:ld("decks",{}),leader:null,main:{},tab:"dash",q:"",col:""};
+const A={id:["card_set_id","card_id","id"],name:["card_name","name"],type:["card_type","type"],color:["card_color","color"],cost:["card_cost","cost"],power:["card_power","power"],counter:["counter_amount","counter"],life:["life"],text:["card_text","text"],image:["card_image","image"]};
+const g=(r,f)=>{for(const k of A[f])if(k in r)return r[k]};const num=v=>{const n=parseInt(v);return isNaN(n)?null:n};
+const lf=v=>v>=1&&v<=10?v:null;
+const base=id=>(String(id).toUpperCase().match(/^[A-Z0-9]+-\d{3}/)||[null])[0];
+function maxCopies(t){t=(t||"").toLowerCase();if(t.includes("any number of")&&t.includes("deck"))return 50;const m=t.match(/up to (\d+) copies/);return m?+m[1]:4}
+const cleanText=t=>{t=String(t??"").replace(/This card has been officially errata'd\./g,"").trim();return t==="NULL"?"":t};
+const isBaseRow=r=>r.card_number?1:(r.card_image_id&&r.card_image_id!==g(r,"id")?0:1);
+function ingest(rows){const out={};let skipped=0;rows.sort((a,b)=>isBaseRow(b)-isBaseRow(a));
+for(const r of rows){let c;if(r.card_number){c={card_number:r.card_number,name:r.name,type:r.type,colors:(r.colors||"").split(",").filter(Boolean),cost:r.cost,power:r.power,counter:r.counter,life:r.life,text:r.text||"",max:r.max_copies||4,image:r.image}}
+else{const id=g(r,"id"),ty=String(g(r,"type")||"").toUpperCase();if(!id||!g(r,"name")||!g(r,"color")){skipped++;continue}if(!["LEADER","CHARACTER","EVENT","STAGE"].includes(ty))continue;
+c={card_number:base(id),name:g(r,"name"),type:ty,colors:String(g(r,"color")).split(/[\/,\s]+/).map(x=>x.trim()).filter(Boolean).map(x=>x[0].toUpperCase()+x.slice(1).toLowerCase()),cost:num(g(r,"cost")),power:num(g(r,"power")),counter:num(g(r,"counter")),life:lf(num(g(r,"life"))),text:cleanText(g(r,"text")),max:maxCopies(g(r,"text")),image:g(r,"image")}}
+if(c.card_number&&!out[c.card_number])out[c.card_number]=c}
+return{out,skipped}}
+function setCards(rows,src){const{out,skipped}=ingest(rows);if(!Object.keys(out).length){alert("Nessuna carta valida. Campi attesi: vedi 'opdeck inspect-api'.");return}
+S.cards=out;S.info={src,at:new Date().toISOString(),n:Object.keys(out).length,skipped};sv("cards",out);sv("info",S.info);render()}
+async function fromApi(){const r=[],ok=[],ko=[];for(const u of["https://www.optcgapi.com/api/allPromos/?format=json","https://optcgapi.com/api/allSTCards/?format=json","https://optcgapi.com/api/allSetCards/?format=json"]){const e=u.split("/api/")[1].split("/")[0];try{const x=await fetch(u);const d=await x.json();if(!Array.isArray(d))throw new Error("risposta non valida");for(const y of d)r.push(y);ok.push(e)}catch(er){ko.push(e+": "+er.message)}}
+if(!r.length)return alert("Download diretto non riuscito (probabile blocco CORS del browser).\nApri a mano i tre URL (allPromos, allSTCards, allSetCards), salva ognuno con Ctrl+S come .json e caricali insieme con 'Carica cards.json' (selezione multipla).\n"+ko.join("\n"));
+setCards(r,"https://optcgapi.com/api/ ("+ok.join(", ")+")");if(ko.length)alert("Non scaricato: "+ko.join("; "))}
+const readFile=(f,cb)=>{const fr=new FileReader();fr.onload=()=>{try{cb(JSON.parse(fr.result),f.name)}catch(e){alert("JSON non valido: "+e.message)}};fr.readAsText(f)};
+function validate(){const I=[],E=(c,m)=>I.push(["error",c,m]),W=(c,m)=>I.push(["warning",c,m]),L=S.cards[S.leader];if(!L){E("LEADER","Nessun Leader selezionato");return I}
+if(/(cannot|can't|can only|only)\b[^.]{0,60}\b(include|deck)/i.test(L.text))W("RESTRIZIONE_LEADER","Il testo del Leader può contenere restrizioni NON verificate dal sistema");
+const n=Object.values(S.main).reduce((a,b)=>a+b,0);if(n!=50)E("DIMENSIONE",`main deck di ${n} carte, richieste 50`);
+for(const[k,q]of Object.entries(S.main)){const c=S.cards[k];if(q>c.max)E("COPIE",`${k} ${c.name}: ${q} copie, max ${c.max}`);if(!c.colors.some(x=>L.colors.includes(x)))E("COLORE",`${k} ${c.name}: ${c.colors.join("/")} incompatibile`)}
+for(const b of S.ban){const has=x=>x in S.main||x==S.leader;if(b.kind=="ban"&&has(b.card_number))E("BANDITA",b.card_number);else if(b.kind=="limit"&&(S.main[b.card_number]||0)>b.limit_n)E("LIMITE",`${b.card_number} max ${b.limit_n}`);else if(b.kind=="pair"&&has(b.card_number)&&has(b.other_number))E("COPPIA_BANDITA",b.card_number+" + "+b.other_number)}
+return I}
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const list=t=>Object.values(S.cards).filter(c=>c.type==t);const COLS=["Red","Green","Blue","Purple","Black","Yellow"];
+const filt=a=>a.filter(c=>(!S.q||(c.name+c.card_number+c.text).toLowerCase().includes(S.q.toLowerCase()))&&(!S.col||c.colors.includes(S.col)));
+const tools=()=>`<div class="row"><input id="q" placeholder="Cerca" value="${esc(S.q)}" oninput="S.q=this.value;sub()"><select onchange="S.col=this.value;sub()"><option value="">Tutti i colori</option>${COLS.map(c=>`<option ${S.col==c?"selected":""}>${c}</option>`).join("")}</select></div>`;
+let sub=()=>{};
+const V={
+dash:()=>`<div class="card"><h3>Stato dati</h3>${S.info?`<p><b>${S.info.n}</b> carte · fonte: ${esc(S.info.src)} · aggiornate: ${esc(S.info.at)}${S.info.skipped?` · <span class="w">${S.info.skipped} record scartati</span>`:""}</p>`:'<p class="w">Nessuna carta caricata.</p>'}
+<div class="row"><button class="b p" onclick="fromApi()">Scarica da optcgapi.com</button><label class="b">Carica cards.json (anche più file insieme) <input type="file" accept=".json" multiple hidden onchange="loadFiles(this.files)"></label>
+<label class="b">Carica banlist.json <input type="file" accept=".json" hidden onchange="readFile(this.files[0],d=>{S.ban=d.entries;sv('ban',S.ban);alert(S.ban.length+' voci')})"></label></div>
+<p class="mu">Banlist caricata: ${S.ban.length} voci · Mazzi salvati: ${Object.keys(S.saved).length}</p></div>
+<div class="card"><h3>Stato moduli</h3><table>${[["Database carte + legalità","Fase 1","o","Attivo"],["Meta (import manuale con fonte e data)","Fase 2","w","Parziale: nessun recupero automatico"],["Motore di simulazione + effetti DSL","Fasi 3-4","o","Attivo (copertura effetti parziale)"],["Ottimizzatore (ricerca locale + validazione)","Fase 6","o","Attivo"]].map(r=>`<tr><td>${r[0]}</td><td>${r[1]}</td><td class="${r[2]}">${r[3]}</td></tr>`).join("")}</table></div>`,
+lead:()=>`${tools()}<div class="grid" id="res"></div>`,
+meta:()=>metaView(),
+sim:()=>simView(),cov:()=>covView(),pt:()=>ptView_(),
+opt:()=>optView(),
+db:()=>`${tools()}<div class="card wrap"><table><thead><tr><th>N°</th><th>Nome</th><th>Tipo</th><th>Colore</th><th>Costo</th><th>Potere</th><th>Counter</th></tr></thead><tbody id="res"></tbody></table></div>`,
+build:()=>{const L=S.cards[S.leader];if(!L)return'<div class="card">Seleziona prima un Leader nella sezione Leader.</div>';
+return`<div class="card"><b>${esc(L.name)}</b> <span class="tag">${L.card_number}</span> ${L.colors.join("/")}<p class="mu">${esc(L.text)}</p></div><div class="two"><div>${tools()}<div class="card wrap" style="max-height:60vh;overflow:auto"><table><tbody id="res"></tbody></table></div></div><div><div class="card"><div class="row"><input id="nm" placeholder="Nome versione"><button class="b p" onclick="save()">Salva</button><button class="b" onclick="exp()">Esporta JSON</button></div><div id="deck"></div></div><div class="card" id="val"></div><div class="card"><h4>Confronta versioni</h4><div class="row"><select id="ca">${opts()}</select><select id="cb">${opts()}</select><button class="b" onclick="cmp()">Confronta</button></div><div id="cmp"></div></div></div></div>`},
+stats:()=>{const m=Object.entries(S.main);if(!m.length)return suiteCard()+'<div class="card">Costruisci un mazzo nel Deck Builder.</div>';const cur={},ty={};let ctr=0;for(const[k,q]of m){const c=S.cards[k];const x=Math.min(c.cost??0,10);cur[x]=(cur[x]||0)+q;ty[c.type]=(ty[c.type]||0)+q;ctr+=(c.counter||0)*q}
+return`<div class="card"><h3>Analisi statica del mazzo</h3><p class="mu">Calcolata sulla decklist corrente, <b>non è un win rate</b>.</p><h4>Curva dei costi</h4>${[...Array(11).keys()].map(i=>`<div>${String(i).padStart(2)} <span class="bar" style="width:${(cur[i]||0)*12}px"></span> ${cur[i]||0}</div>`).join("")}<h4>Tipi</h4>${Object.entries(ty).map(([k,v])=>`${k}: ${v}`).join(" · ")}<p>Counter totale: ${ctr}</p></div>${suiteCard()}`}};
+const opts=()=>Object.keys(S.saved).map(k=>`<option>${esc(k)}</option>`).join("");
+function rows(){const r=$("#res");if(!r)return;const t=S.tab;
+if(t=="lead")r.innerHTML=filt(list("LEADER")).map(c=>`<div class="lead ${S.leader==c.card_number?"sel":""}" onclick="pick('${c.card_number}')">${c.image?`<img loading="lazy" src="${esc(c.image)}">`:""}<div>${esc(c.name)}</div><small>${c.card_number} · ${c.colors.join("/")} · vita ${c.life??"?"}</small></div>`).join("")||'<p class="mu">Carica le carte dal Dashboard.</p>';
+if(t=="db")r.innerHTML=filt(Object.values(S.cards)).slice(0,400).map(c=>`<tr><td>${c.card_number}</td><td>${esc(c.name)}</td><td>${c.type}</td><td>${c.colors.join("/")}</td><td>${c.cost??""}</td><td>${c.power??""}</td><td>${c.counter??""}</td></tr>`).join("");
+if(t=="build"){const L=S.cards[S.leader];r.innerHTML=filt(Object.values(S.cards).filter(c=>c.type!="LEADER"&&c.colors.some(x=>L.colors.includes(x)))).slice(0,300).map(c=>`<tr><td>${c.card_number}</td><td>${esc(c.name)}</td><td>${c.cost??""}</td><td>${c.type[0]}</td><td><button class="b" onclick="add('${c.card_number}',1)">+</button></td></tr>`).join("");deck()}}
+function deck(){const d=$("#deck");if(!d)return;const n=Object.values(S.main).reduce((a,b)=>a+b,0);d.innerHTML=`<b>${n}/50</b><table>${Object.entries(S.main).sort().map(([k,q])=>`<tr><td>${q}×</td><td>${k} ${esc(S.cards[k].name)}</td><td><button class="b" onclick="add('${k}',-1)">−</button><button class="b" onclick="add('${k}',1)">+</button></td></tr>`).join("")}</table>`;
+$("#val").innerHTML=covLine()+validate().map(([s,c,m])=>`<div class="${s=="error"?"e":"w"}">${s=="error"?"✗":"!"} ${c}: ${esc(m)}</div>`).join("")||'<div class="o">✓ Mazzo legale secondo le regole implementate</div>'}
+function pick(id){S.leader=id;S.main={};S.tab="build";render()}
+function add(k,d){S.main[k]=(S.main[k]||0)+d;if(S.main[k]<=0)delete S.main[k];deck()}
+function save(){const n=$("#nm").value.trim();if(!n)return alert("Nome richiesto");S.saved[n]={leader:S.leader,cards:{...S.main},at:new Date().toISOString()};sv("decks",S.saved);render()}
+function exp(){const b=new Blob([JSON.stringify({leader:S.leader,cards:S.main},null,1)],{type:"application/json"}),a=document.createElement("a");a.href=URL.createObjectURL(b);a.download="deck.json";a.click()}
+function cmp(){const a=S.saved[$("#ca").value],b=S.saved[$("#cb").value];if(!a||!b)return;const ks=[...new Set([...Object.keys(a.cards),...Object.keys(b.cards)])].sort().filter(k=>a.cards[k]!=b.cards[k]);
+$("#cmp").innerHTML=`<p class="mu">Leader: ${a.leader} vs ${b.leader}</p><table>${ks.map(k=>`<tr><td>${k} ${esc(S.cards[k]?.name)}</td><td>${a.cards[k]||0}</td><td>→</td><td>${b.cards[k]||0}</td></tr>`).join("")||"<tr><td>Identici</td></tr>"}</table>`}
+function render(){$("#nav").innerHTML=T.map(([k,l])=>`<button class="${S.tab==k?"on":""}" onclick="S.tab='${k}';render()">${l}</button>`).join("");$("#m").innerHTML=V[S.tab]();sub=rows;rows()}
+function covLine(){const bad=Object.keys(S.main).filter(k=>!fxResolve(S.cards[k]).ok),nb=bad.reduce((a,k)=>a+S.main[k],0),n=Object.values(S.main).reduce((a,b)=>a+b,0);
+return`<div class="mu">Effetti simulabili: ${n-nb}/${n} carte${bad.length?` · non implementate: ${bad.join(", ")}`:""}</div>`}
+const deckOpts=cur=>(cur&&S.leader?`<option value="__cur">Mazzo corrente (${S.leader})</option>`:"")+Object.keys(S.saved).map(k=>`<option>${esc(k)}</option>`).join("");
+const getDeck=v=>v==="__cur"?{leader:S.leader,cards:S.main}:S.saved[v];
+function simView(){return`<div class="card"><h3>Simulatore</h3><p class="mu">Motore ${ENGINE_VERSION}: regole base + effetti del DSL. Le carte con effetti non coperti rendono il mazzo non simulabile in modo stretto. Strategia automatica euristica e documentata; risultati = <b>simulazione</b>, non dati di torneo.</p>
+<div class="row"><label>A <select id="sa">${deckOpts(1)}</select></label><label>B <select id="sb">${deckOpts(1)}</select></label>
+<label>Partite <select id="sn"><option>1000</option><option>5000</option><option>20000</option></select></label><label>Seed <input id="ss" type="number" value="1" style="width:80px"></label>
+<label><input type="checkbox" id="ap"> Consenti simulazione parziale (NON attendibile)</label><button class="b p" onclick="runSim()">Simula</button></div><div id="simout"></div></div>
+<div class="card"><h4>Importa decklist avversaria (testo)</h4><p class="mu">Formato per riga: <code>4xOP01-016</code>, con il Leader come riga da 1. Rifiutata se non somma a 50 carte o contiene carte sconosciute.</p>
+<div class="row"><input id="in" placeholder="Nome mazzo"><button class="b" onclick="importDeck()">Importa</button></div><textarea id="it" rows="6" style="width:100%" placeholder="1xOP01-001&#10;4xOP01-016"></textarea></div>`}
+function parseDeck(text){const main={},err=[];let leader=null;
+for(const line of text.split("\n")){const l=line.trim();if(!l||l[0]==="#")continue;
+ let m=l.match(/^(\d+)\s*[xX×]?\s*([A-Za-z0-9]+-\d{3})\b/);if(!m){const k=l.match(/^([A-Za-z0-9]+-\d{3})\s*[xX×]\s*(\d+)\s*$/);m=k&&[0,k[2],k[1]]}
+ if(!m){const k=l.match(/^(\d+)\s*[xX×]?\s+.*\(([A-Za-z0-9]+-\d{3})\)/);m=k&&[0,k[1],k[2]]}
+ if(!m){err.push(l);continue}const id=base(m[2]),c=S.cards[id];if(!c){err.push(l+" (carta sconosciuta)");continue}
+ if(c.type==="LEADER")leader=id;else main[id]=(main[id]||0)+ +m[1]}
+return{leader,main,n:Object.values(main).reduce((a,b)=>a+b,0),err}}
+function importDeck(){const nm=$("#in").value.trim();if(!nm)return alert("Nome richiesto");const d=parseDeck($("#it").value);
+if(!d.leader||d.n!==50||d.err.length)return alert(`Importazione rifiutata: Leader ${d.leader||"mancante"}, carte ${d.n}/50`+(d.err.length?`, righe non valide: ${d.err.slice(0,5).join(" | ")}`:""));
+S.saved[nm]={leader:d.leader,cards:d.main,at:new Date().toISOString()};sv("decks",S.saved);render()}
+async function runSim(){const a=getDeck($("#sa").value),b=getDeck($("#sb").value),out=$("#simout");
+if(!a||!b||!a.leader||!b.leader)return alert("Seleziona due mazzi (salva il mazzo corrente o importane uno).");
+for(const d of[a,b])if(Object.values(d.cards).reduce((x,y)=>x+y,0)!==50)return alert("Ogni mazzo deve avere 50 carte.");
+const A=buildDeck(S.cards,a.leader,a.cards),B=buildDeck(S.cards,b.leader,b.cards),bad=unimpl(A,B),n=+$("#sn").value,seed=+$("#ss").value||1;
+if(bad.length&&!$("#ap").checked){out.innerHTML=`<p><b class="e">Simulazione rifiutata:</b> ${bad.length} carte con effetti non implementati.</p><div class="wrap"><table>${bad.slice(0,40).map(k=>`<tr><td>${k}</td><td>${esc(S.cards[k].name)}</td><td class="mu">${esc(fxNorm(S.cards[k].text).slice(0,110))}</td></tr>`).join("")}</table></div>`;return}
+const r=newRun(A,B,seed),t0=performance.now();
+while(r.i<n){stepRun(r,Math.min(100,n-r.i));out.innerHTML=`Simulate ${r.i}/${n}…`;await new Promise(x=>setTimeout(x))}
+const s=summarize(r,n),pc=x=>(100*x).toFixed(1)+"%",ci=(w,m)=>{const[l,h]=wilson(w,m);return`${pc(w/Math.max(m,1))} [${pc(l)}–${pc(h)}]`};
+out.innerHTML=(s.partial?`<p class="w"><b>PARZIALE – NON ATTENDIBILE:</b> effetti non simulati per ${s.unimplemented.length} carte (${esc(s.unimplemented.slice(0,12).join(", "))}).</p>`:"")+
+`<table><tr><td>Win rate A (IC 95%)</td><td><b>${ci(s.wins_a,n)}</b></td></tr><tr><td>Vittorie A / B / pareggi</td><td>${s.wins_a} / ${s.wins_b} / ${s.draws}</td></tr>
+<tr><td>A per primo</td><td>${ci(s.a_first.wins,s.a_first.games)} (${s.a_first.games} partite)</td></tr><tr><td>A per secondo</td><td>${ci(s.a_second.wins,s.a_second.games)} (${s.a_second.games} partite)</td></tr>
+<tr><td>Turni medi</td><td>${s.avg_turns.toFixed(1)}</td></tr><tr><td>Fine partita</td><td>${esc(JSON.stringify(s.end_reasons))}</td></tr>
+<tr><td>Partite · seed · motore</td><td>${n} · ${seed} · ${s.engine} · ${((performance.now()-t0)/1000).toFixed(1)}s</td></tr></table><p class="mu">Etichetta: SIMULAZIONE${s.partial?" (regole base, effetti non simulati)":""}. Riproducibile con lo stesso seed.</p>`}
+
+const TAGS="On Play|When Attacking|Trigger|Counter|Main|Activate: Main|On K\\.O\\.|Your Turn|Opponent's Turn",KNOWNTAG=new RegExp("^\\[(?:"+TAGS+"|Once Per Turn|Blocker|Rush|Double Attack|Banish|DON!! x\\d+|On Your Opponent's Attack|End of Your Turn)\\]$");
+function skel(s){const m=s.slice(1).search(new RegExp("\\[(?:"+TAGS+")\\]")),seg=m<0?s:s.slice(0,m+1);
+ return seg.replace(/\[[^\]]*\]/g,x=>KNOWNTAG.test(x)?x:"[X]").replace(/\{[^}]*\}/g,"{T}").replace(/\d+/g,"N").replace(/\bcards?\b/g,"card(s)").trim().slice(0,150)}
+function covReport(){const cs=Object.values(S.cards),by={},tpl={};let ok=0;
+ for(const c of cs){const r=fxResolve(c),b=by[c.type]||(by[c.type]=[0,0]);b[1]++;if(r.ok){ok++;b[0]++}else{const k=skel(fxParse(c.text).rest),t=tpl[k]||(tpl[k]={n:0,ex:c});t.n++}}
+ return{n:cs.length,ok,by,top:Object.entries(tpl).sort((a,b)=>b[1].n-a[1].n)}}
+function covView(){if(!Object.keys(S.cards).length)return'<div class="card">Carica prima le carte dal Dashboard.</div>';
+ const r=covReport(),pc=(a,b)=>(100*a/Math.max(b,1)).toFixed(1)+"%",
+ txt=`OPDeck copertura effetti · motore ${ENGINE_VERSION} · ${r.ok}/${r.n} carte implementate\n`+r.top.slice(0,150).map(([k,v])=>`${v.n}\t${k}\t[${v.ex.card_number}]`).join("\n");
+ return`<div class="card"><h3>Copertura effetti</h3><p><b>${r.ok}/${r.n}</b> carte pienamente implementate (${pc(r.ok,r.n)}). Le altre restano non simulabili in modo stretto.</p><table>${Object.entries(r.by).map(([t,[a,b]])=>`<tr><td>${t}</td><td>${a}/${b}</td><td>${pc(a,b)}</td></tr>`).join("")}</table></div>
+<div class="card"><h4>Pattern che bloccano più carte</h4><p class="mu">Per ogni carta non coperta: primo frammento non riconosciuto, normalizzato (numeri→N, nomi→[X], tipi→{T}). Copia il report (clic nel riquadro, poi Ctrl+C) e incollalo in chat: i pattern si implementano in ordine di impatto.</p>
+<textarea rows="8" style="width:100%" readonly onclick="this.select()">${esc(txt)}</textarea><div class="wrap"><table><tr><th>Carte</th><th>Pattern</th><th>Esempio</th></tr>${r.top.slice(0,60).map(([k,v])=>`<tr><td>${v.n}</td><td>${esc(k)}</td><td>${v.ex.card_number}</td></tr>`).join("")}</table></div></div>`}
+
+/* ---- Playtest solo (stile "Solo vs Self"): regole automatiche, effetti risolti a mano ---- */
+let PT=null;
+const ptDef=c=>{const t=c.text||"";return{id:c.card_number,name:c.name,type:c.type,cost:c.cost||0,power:c.power||0,counter:c.counter||0,life:c.life||0,text:t,colors:c.colors,
+ blocker:/\[Blocker\]/.test(t),rush:/\[Rush\]/.test(t),dbl:/\[Double Attack\]/.test(t),banish:/\[Banish\]/.test(t),effects:[]}};
+const ptLog=m=>{PT.log.push(m);if(PT.log.length>40)PT.log.shift()};
+const ptUnit=(p,z,i)=>z==="leader"?PT.pl[p].leader:PT.pl[p].field[i];
+function ptCardAt(p,z,i){const P=PT.pl[p];return z==="leader"||z==="field"?ptUnit(p,z,i).d:P[z][i]}
+function ptStart(){const A=getDeck($("#pa").value),B=getDeck($("#pb").value);if(!A||!B||!A.leader||!B.leader)return alert("Seleziona due mazzi.");
+ for(const d of[A,B])if(Object.values(d.cards).reduce((x,y)=>x+y,0)!==50)return alert("Ogni mazzo deve avere 50 carte.");
+ const seed=+$("#ps").value||(Date.now()%1000000000),rng=new Rng(seed),memo={},df=n=>memo[n]||(memo[n]=ptDef(S.cards[n]));
+ const pl=[A,B].map(d=>new Player(df(d.leader),Object.entries(d.cards).flatMap(([k,q])=>Array(q).fill(df(k)))));
+ for(const P of pl){rng.shuffle(P.deck);for(let i=0;i<5;i++)P.hand.push(P.deck.shift());P.stage=[]}
+ PT={pl,rng,t:0,cur:0,first:rng.below(2),log:[],sel:null,battle:null,trig:null,view:null,winner:null,setup:true,mull:[false,false],ign:false,seed};
+ ptLog(`Seed ${seed}. Parte il giocatore ${PT.first+1}. Mulligan (una volta per giocatore), poi "Inizia partita".`);renderPT()}
+function ptMull(p){if(PT.mull[p])return;const P=PT.pl[p];PT.mull[p]=true;P.deck.push(...P.hand);P.hand=[];PT.rng.shuffle(P.deck);for(let i=0;i<5;i++)P.hand.push(P.deck.shift());ptLog(`Giocatore ${p+1}: mulligan`);renderPT()}
+function ptGo(){for(const P of PT.pl)for(let k=0;k<P.leader.d.life;k++)P.life.push(P.deck.shift());PT.setup=false;ptBegin(PT.first)}
+function ptBegin(p){const P=PT.pl[p];PT.t++;PT.cur=p;for(const u of[P.leader,...P.field]){P.rst+=u.don;u.don=0;u.rested=false}P.act+=P.rst;P.rst=0;
+ if(PT.t>1){if(!P.deck.length){PT.winner=1-p;ptLog("Mazzo vuoto: vince il giocatore "+(2-p));return renderPT()}P.hand.push(P.deck.shift())}
+ const n=Math.min(PT.t===1?1:2,P.donDeck,10-P.donOnField());P.donDeck-=n;P.act+=n;ptLog(`Turno ${PT.t}: giocatore ${p+1}`);renderPT()}
+function ptEnd(){if(!PT||PT.setup||PT.battle||PT.trig||PT.winner!==null)return;for(const P of PT.pl)for(const u of[P.leader,...P.field])u.bonus=0;ptBegin(1-PT.cur)}
+function ptSel(p,z,i){PT.sel={p,z,i};renderPT()}
+function ptTake(P,z,i){if(z==="field"){const u=P.field.splice(i,1)[0];P.rst+=u.don;return u.d}return P[z].splice(i,1)[0]}
+function ptPut(P,to,c){if(to==="deckTop")P.deck.unshift(c);else if(to==="deckBottom")P.deck.push(c);else if(to==="lifeTop")P.life.unshift(c);else if(to==="field")P.field.push(new Unit(c,PT.t));else P[to].push(c)}
+function ptMove(p,z,i,to){const P=PT.pl[p];ptPut(P,to,ptTake(P,z,i));PT.sel=null;renderPT()}
+function ptPlay(p,i){const P=PT.pl[p],c=P.hand[i];if(c.cost>P.act)return alert("DON!! attivi insufficienti.");
+ if(c.type==="CHARACTER"&&P.field.length>=5)return alert("Campo pieno: manda prima un Character al cimitero.");
+ P.act-=c.cost;P.rst+=c.cost;P.hand.splice(i,1);PT.sel=null;
+ if(c.type==="CHARACTER")P.field.push(new Unit(c,PT.t));else if(c.type==="STAGE"){if(P.stage.length)P.trash.push(P.stage.pop());P.stage.push(c)}else P.trash.push(c);
+ ptLog(`G${p+1} gioca ${c.name}${c.text?" — RISOLVI A MANO: "+c.text:""}`);renderPT()}
+function ptUnitAct(k,n){const s=PT.sel;if(!s)return;const P=PT.pl[s.p],u=ptUnit(s.p,s.z,s.i);
+ if(k==="rest")u.rested=!u.rested;else if(k==="att"){if(P.act>0){P.act--;u.don++}}else if(k==="det"){if(u.don>0){u.don--;P.rst++}}else if(k==="bonus")u.bonus+=n;renderPT()}
+function ptDon(k){const P=PT.pl[PT.sel?PT.sel.p:PT.cur];
+ if(k==="add"&&P.donDeck>0&&P.donOnField()<10){P.donDeck--;P.act++}else if(k==="wake"&&P.rst>0){P.rst--;P.act++}else if(k==="ret"&&P.act>0){P.act--;P.donDeck++}renderPT()}
+function ptDraw(p){const P=PT.pl[p];if(!P.deck.length){PT.winner=1-p;ptLog("Mazzo vuoto: vince il giocatore "+(2-p))}else P.hand.push(P.deck.shift());renderPT()}
+function ptView(p,z,n){PT.view=z?{p,z,n:n||99}:null;renderPT()}
+function ptVMove(i,to){const v=PT.view;ptPut(PT.pl[v.p],to,ptTake(PT.pl[v.p],v.z,i));renderPT()}
+function ptAtkStart(){const s=PT.sel;if(!s||s.p!==PT.cur||PT.battle||PT.trig||PT.winner!==null||(s.z!=="leader"&&s.z!=="field"))return;const u=ptUnit(s.p,s.z,s.i);
+ if(PT.t<=2)return alert("Nessun attacco al primo turno di ciascun giocatore.");if(u.rested)return alert("L'unità è a riposo.");
+ if(s.z==="field"&&u.tp>=PT.t&&!u.d.rush&&!PT.ign)return alert("Appena giocato: non può attaccare (se un effetto concede Rush, attiva 'Ignora restrizioni').");
+ PT.battle={p:s.p,u,step:"target",dmg:u.d.dbl?2:1,ban:u.d.banish,extra:0,tgt:null};PT.sel=null;renderPT()}
+function ptTarget(z,i){const b=PT.battle,D=PT.pl[1-b.p];b.u.rested=true;b.tgt=z==="leader"?D.leader:D.field[i];b.step="block";ptLog(`G${b.p+1} attacca ${b.tgt.d.name} con ${b.u.d.name}`);renderPT()}
+function ptBlock(i){const b=PT.battle,D=PT.pl[1-b.p];if(i>=0){const u=D.field[i];u.rested=true;b.tgt=u;ptLog("Blocca: "+u.d.name)}b.step="counter";renderPT()}
+function ptCounter(i){const b=PT.battle,D=PT.pl[1-b.p],c=D.hand.splice(i,1)[0];D.trash.push(c);b.extra+=c.counter;renderPT()}
+function ptCounterEv(i){const b=PT.battle,D=PT.pl[1-b.p],c=D.hand[i];if(c.cost>D.act)return alert("DON!! attivi insufficienti.");
+ const v=parseInt(prompt("Potere aggiunto da questo Counter (leggi il testo):","2000"));if(isNaN(v))return;D.act-=c.cost;D.rst+=c.cost;D.hand.splice(i,1);D.trash.push(c);b.extra+=v;renderPT()}
+function ptBat(k,v){const b=PT.battle;if(k==="x")b.extra+=v;else if(k==="dmg")b.dmg=v;else if(k==="ban")b.ban=!b.ban;renderPT()}
+function ptResolve(){const b=PT.battle,D=PT.pl[1-b.p],apw=b.u.d.power+1000*b.u.don+b.u.bonus,tpw=b.tgt.d.power+b.tgt.bonus+b.extra;PT.battle=null;
+ ptLog(`Battaglia ${apw} vs ${tpw}: ${apw>=tpw?"colpisce":"fallisce"}`);
+ if(apw>=tpw){if(b.tgt===D.leader)ptDamage(1-b.p,b.dmg,b.ban);else{D.field.splice(D.field.indexOf(b.tgt),1);D.trash.push(b.tgt.d);D.rst+=b.tgt.don;ptLog("K.O.: "+b.tgt.d.name)}}renderPT()}
+function ptDamage(d,n,ban){const D=PT.pl[d];while(n>0){if(!D.life.length){PT.winner=1-d;ptLog("VITTORIA giocatore "+(2-d));return}
+ const c=D.life.shift();n--;if(ban){D.trash.push(c);continue}if(/\[Trigger\]/.test(c.text)){PT.trig={d,c,n,ban};return}D.hand.push(c)}}
+function ptTrig(use){const T=PT.trig,D=PT.pl[T.d];PT.trig=null;if(use){D.trash.push(T.c);ptLog(`Trigger di ${T.c.name} — RISOLVI A MANO: ${T.c.text}`)}else D.hand.push(T.c);ptDamage(T.d,T.n,T.ban);renderPT()}
+const ptChip=(p,z,i,c,x="",rs=false)=>`<span class="chip ${PT.sel&&PT.sel.p===p&&PT.sel.z===z&&PT.sel.i===i?"on":""} ${rs?"rs":""}" onclick="ptSel(${p},'${z}',${i})" title="${esc(c.text)}">${esc(c.name)} <small>${c.type[0]} ${c.cost}c ${c.power||""}${c.counter?" +"+c.counter:""}${x}</small></span>`;
+const ptB=(l,f,dis)=>`<button class="b" ${dis?"disabled":""} onclick="${f}">${l}</button>`;
+function ptHTML(){if(!PT)return'<p class="mu">Scegli due mazzi e premi Avvia.</p>';
+ const side=p=>{const P=PT.pl[p],u=(x,z,i)=>ptChip(p,z,i,x.d,(x.rested?" ⟳":"")+(x.don?` DON×${x.don}`:"")+(x.bonus?` +${x.bonus}`:""),x.rested);
+  return`<div class="card" ${PT.cur===p&&!PT.setup?'style="outline:2px solid var(--ac)"':""}><b>Giocatore ${p+1}</b> · Vita ${P.life.length} · Mazzo ${P.deck.length} · Cimitero ${P.trash.length} · DON!! attivi ${P.act} / riposo ${P.rst} / mazzo ${P.donDeck}
+  <div>Leader: ${u(P.leader,"leader",0)}</div><div>Campo: ${P.field.map((x,i)=>u(x,"field",i)).join("")||"—"} ${P.stage.map((c,i)=>ptChip(p,"stage",i,c)).join("")}</div><div>Mano: ${P.hand.map((c,i)=>ptChip(p,"hand",i,c)).join("")||"—"}</div>
+  <div class="row">${ptB("Cimitero",`ptView(${p},'trash')`)}${ptB("Top 5",`ptView(${p},'deck',5)`)}${ptB("Top 10",`ptView(${p},'deck',10)`)}${ptB("Vita",`ptView(${p},'life')`)}${ptB("Pesca",`ptDraw(${p})`)}</div></div>`};
+ let h=PT.winner!==null?`<div class="card"><b class="o">Vince il giocatore ${PT.winner+1}</b></div>`:"";
+ h+=side(1)+side(0);
+ if(PT.setup)return h+`<div class="card row">${[0,1].map(p=>ptB(`Mulligan G${p+1}`,`ptMull(${p})`,PT.mull[p])).join("")}${ptB("Inizia partita","ptGo()")}</div>`+ptLogHTML();
+ const s=PT.sel;let bar="";
+ if(s){const c=ptCardAt(s.p,s.z,s.i),own=s.p===PT.cur;
+  bar=`<div class="mu"><b>${esc(c.name)}</b> ${c.id} · ${c.type} · ${(c.colors||[]).join("/")} · costo ${c.cost} · potere ${c.power} · counter ${c.counter} · vita ${c.life}<br>${esc(c.text)}</div><div class="row">`;
+  if(s.z==="hand")bar+=ptB("Gioca",`ptPlay(${s.p},${s.i})`)+["trash:Cimitero","deckBottom:Fondo mazzo","deckTop:Cima mazzo"].map(x=>ptB(x.split(":")[1],`ptMove(${s.p},'hand',${s.i},'${x.split(":")[0]}')`)).join("");
+  else if(s.z==="leader"||s.z==="field")bar+=(own?ptB("Attacca","ptAtkStart()"):"")+ptB("Riposo/Attiva","ptUnitAct('rest')")+ptB("+1 DON!!","ptUnitAct('att')")+ptB("−1 DON!!","ptUnitAct('det')")+ptB("+1000 turno","ptUnitAct('bonus',1000)")+(s.z==="field"?["trash:K.O.","hand:In mano","deckBottom:Fondo mazzo"].map(x=>ptB(x.split(":")[1],`ptMove(${s.p},'field',${s.i},'${x.split(":")[0]}')`)).join(""):"");
+  else bar+=["trash:Cimitero","hand:In mano"].map(x=>ptB(x.split(":")[1],`ptMove(${s.p},'${s.z}',${s.i},'${x.split(":")[0]}')`)).join("");
+  bar+="</div>"}
+ h+=`<div class="card">${bar||'<span class="mu">Clicca una carta per vederne il testo e le azioni.</span>'}<div class="row">${ptB("Termina turno","ptEnd()")}${ptB("DON!! +1 dal mazzo","ptDon('add')")}${ptB("DON!! riposo→attivo","ptDon('wake')")}${ptB("DON!! −1 nel mazzo","ptDon('ret')")}
+  <label><input type="checkbox" ${PT.ign?"checked":""} onchange="PT.ign=this.checked"> Ignora restrizioni d'attacco (effetti)</label></div></div>`;
+ const b=PT.battle;if(b){const A=b.p,D=PT.pl[1-A];h+=`<div class="card"><b>Battaglia</b> — ${esc(b.u.d.name)} (potere ${b.u.d.power+1000*b.u.don+b.u.bonus}) · `;
+  if(b.step==="target")h+=`scegli il bersaglio: <div class="row">${ptB("Leader avversario",`ptTarget('leader',0)`)}${D.field.map((x,i)=>x.rested?ptB(esc(x.d.name),`ptTarget('field',${i})`):"").join("")}${ptB("Annulla","PT.battle=null;renderPT()")}</div>`;
+  else if(b.step==="block")h+=`blocco di G${2-A}: <div class="row">${D.field.map((x,i)=>x.d.blocker&&!x.rested?ptB("Blocca con "+esc(x.d.name),`ptBlock(${i})`):"").join("")}${ptB("Nessun blocco","ptBlock(-1)")}</div>`;
+  else h+=`bersaglio ${esc(b.tgt.d.name)} potere ${b.tgt.d.power+b.tgt.bonus+b.extra} (counter ${b.extra}) · danni ${b.dmg}${b.ban?" · Banish":""}<div class="row">Counter G${2-A}: ${D.hand.map((c,i)=>c.counter?ptB(`${esc(c.name)} +${c.counter}`,`ptCounter(${i})`):c.type==="EVENT"&&/\[Counter\]/.test(c.text)?ptB(`${esc(c.name)} (Event, ${c.cost}c)`,`ptCounterEv(${i})`):"").join("")}${ptB("+1000","ptBat('x',1000)")}${ptB("Danni 1","ptBat('dmg',1)")}${ptB("Danni 2","ptBat('dmg',2)")}${ptB("Banish","ptBat('ban')")}${ptB("Risolvi","ptResolve()")}</div>`;h+="</div>"}
+ if(PT.trig)h+=`<div class="card"><b>Trigger</b> di G${PT.trig.d+1}: ${esc(PT.trig.c.name)} — ${esc(PT.trig.c.text)}<div class="row">${ptB("Attiva (poi al cimitero)","ptTrig(true)")}${ptB("Aggiungi alla mano","ptTrig(false)")}</div></div>`;
+ if(PT.view){const v=PT.view,P=PT.pl[v.p],L=P[v.z].slice(0,v.n);h+=`<div class="card"><b>${v.z==="deck"?"Cima del mazzo":v.z==="life"?"Vita (cima per prima)":"Cimitero"} G${v.p+1}</b> ${ptB("Chiudi","ptView()")}<table>${L.map((c,i)=>`<tr><td>${esc(c.name)} <small class="mu">${c.id} ${esc(c.text).slice(0,70)}</small></td><td>${[["hand","Mano"],["deckBottom","Fondo"],["deckTop","Cima"],["trash","Cimitero"],["field","Campo"],["lifeTop","Vita"]].map(([t,l])=>ptB(l,`ptVMove(${i},'${t}')`)).join("")}</td></tr>`).join("")}</table></div>`}
+ return h+ptLogHTML()}
+const ptLogHTML=()=>`<div class="card mu" style="max-height:150px;overflow:auto">${PT.log.slice().reverse().map(esc).join("<br>")}</div>`;
+function renderPT(){const e=$("#pt");if(e)e.innerHTML=ptHTML()}
+function ptView_(){return`<div class="card"><h3>Playtest solo</h3><p class="mu">Come "Solo vs Self": le regole (turni, DON!!, pescate, battaglia, danni, vita) sono automatiche; gli effetti delle carte li risolvi tu, perché il testo compare nel log e nella scheda. Funziona con qualsiasi carta, anche con effetti non coperti dal simulatore.</p>
+<div class="row"><label>G1 <select id="pa">${deckOpts(1)}</select></label><label>G2 <select id="pb">${deckOpts(1)}</select></label><label>Seed <input id="ps" type="number" style="width:90px"></label><button class="b p" onclick="ptStart()">Avvia</button></div></div><div id="pt">${ptHTML()}</div>`}
+
+function loadFiles(fs){Promise.all([...fs].map(f=>new Promise(r=>{const fr=new FileReader();fr.onload=()=>{try{r(JSON.parse(fr.result))}catch(e){r([])}};fr.readAsText(f)}))).then(a=>setCards(a.flat(),"file: "+[...fs].map(f=>f.name).join(", ")))}
+
+
+/* ---- Meta, analisi vs meta, ottimizzazione ---- */
+const pc=x=>(100*x).toFixed(1)+"%",pp=x=>(x>=0?"+":"")+(100*x).toFixed(1)+" pp",ci=(w,m)=>{const[l,h]=wilson(w,m);return`${pc(w/Math.max(m,1))} [${pc(l)}–${pc(h)}]`};
+const stNm=id=>esc(S.cards[id]?.name||id),today=()=>new Date().toISOString().slice(0,10);
+function metaView(){const rows=S.meta.map((o,i)=>{const L=S.cards[o.leader];return`<tr><td>${esc(o.name)}</td><td>${o.leader} ${esc(L?L.name:"?")}</td><td class="mu">${esc(o.source)}<br>${esc(o.date)}</td><td><input type="number" min="0" step="0.1" value="${o.weight}" style="width:70px" onchange="metaW(${i},this.value)"></td><td><button class="b" onclick="metaDel(${i})">✕</button></td></tr>`}).join("");
+return`<div class="card"><h3>Meta (avversari di riferimento)</h3><p class="mu">Il recupero automatico dei risultati di torneo <b class="w">non è implementato</b>: nessun endpoint verificato e il browser blocca le richieste cross-origin. Gli avversari li definisci tu incollando decklist reali (es. copiate da un torneo o da Limitless) con fonte, data e frequenza (%). Nessun dato è precompilato o inventato. Pesi tutti a 0 = avversari equiprobabili.</p><div class="wrap"><table><thead><tr><th>Mazzo</th><th>Leader</th><th>Fonte · data</th><th>Peso %</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="5" class="mu">Nessun mazzo nel meta.</td></tr>'}</tbody></table></div></div>
+<div class="card"><h4>Aggiungi decklist</h4><div class="row"><input id="mn" placeholder="Nome archetipo"><input id="ms" placeholder="Fonte (URL)" style="flex:1;min-width:200px"><input id="md" type="date" value="${today()}"><input id="mw" type="number" min="0" step="0.1" placeholder="Peso %" style="width:90px"></div><textarea id="mt" rows="6" style="width:100%" placeholder="1xOP01-001&#10;4xOP01-016"></textarea><div class="row"><button class="b p" onclick="metaAdd()">Aggiungi dal testo</button></div><div class="row"><select id="mv">${Object.keys(S.saved).map(k=>`<option>${esc(k)}</option>`).join("")}</select><button class="b" onclick="metaFromSaved()">Aggiungi un mazzo salvato</button></div></div>`}
+function metaAdd(){const nm=$("#mn").value.trim(),src=$("#ms").value.trim(),dt=$("#md").value;if(!nm||!src||!dt)return alert("Servono nome, fonte e data.");
+ const d=parseDeck($("#mt").value);if(!d.leader||d.n!==50||d.err.length)return alert(`Rifiutata: Leader ${d.leader||"mancante"}, carte ${d.n}/50`+(d.err.length?`, righe non valide: ${d.err.slice(0,5).join(" | ")}`:""));
+ S.meta.push({name:nm,leader:d.leader,cards:d.main,source:src,date:dt,weight:+$("#mw").value||0});sv("meta",S.meta);render()}
+function metaFromSaved(){const k=$("#mv").value,d=S.saved[k];if(!d)return alert("Nessun mazzo salvato.");S.meta.push({name:k,leader:d.leader,cards:{...d.cards},source:"mazzo salvato dall'utente (non da torneo)",date:today(),weight:0});sv("meta",S.meta);render()}
+function metaW(i,v){S.meta[i].weight=Math.max(0,+v||0);sv("meta",S.meta)}
+function metaDel(i){S.meta.splice(i,1);sv("meta",S.meta);render()}
+function prep(d,allow,out){if(!d||!d.leader){alert("Seleziona un mazzo.");return null}if(!S.meta.length){alert("Il Meta è vuoto: aggiungi almeno un avversario nella sezione Meta.");return null}
+ if(Object.values(d.cards).reduce((a,b)=>a+b,0)!==50){alert("Il mazzo deve avere 50 carte.");return null}
+ const miss=[d,...S.meta].flatMap(x=>[x.leader,...Object.keys(x.cards)]).filter(k=>!S.cards[k]);if(miss.length){alert("Carte non presenti nel database: "+[...new Set(miss)].slice(0,8).join(", "));return null}
+ const bad=unimpl(buildDeck(S.cards,d.leader,d.cards),...S.meta.map(o=>buildDeck(S.cards,o.leader,o.cards)));
+ if(bad.length&&!allow){out.innerHTML=`<p><b class="e">Rifiutato:</b> ${bad.length} carte con effetti non implementati (o Leader con dati vita non validi).</p><div class="wrap"><table>${bad.slice(0,40).map(k=>`<tr><td>${k}</td><td>${esc(S.cards[k].name)}</td><td class="mu">${esc(fxNorm(S.cards[k].text).slice(0,110))}</td></tr>`).join("")}</table></div>`;return null}
+ return bad}
+function suiteCard(){return`<div class="card"><h3>Analisi vs meta (simulazione)</h3><p class="mu">Il mazzo scelto affronta ogni mazzo della sezione Meta, alternando primo/secondo. ${S.meta.length?"":'<span class="w">Meta vuoto: aggiungi avversari in Meta.</span>'}</p><div class="row"><label>Mazzo <select id="sd">${deckOpts(1)}</select></label><label>Partite/matchup <select id="sm"><option>500</option><option selected>1000</option><option>3000</option></select></label><label>Seed <input id="sx" type="number" value="1" style="width:80px"></label><label><input type="checkbox" id="sp"> Consenti parziale (NON attendibile)</label><button class="b p" onclick="runStats()">Analizza</button></div><div id="stout">${S.res?statHTML(S.res):""}</div></div>`}
+async function runStats(){const d=getDeck($("#sd").value),out=$("#stout"),bad=prep(d,$("#sp").checked,out);if(!bad)return;
+ const n=+$("#sm").value,seed=+$("#sx").value||1;
+ try{const res=await runSuite(S.cards,d,S.meta,n,seed,async(oi,i)=>{out.textContent=`Matchup ${oi+1}/${S.meta.length}: ${i}/${n}…`;await new Promise(x=>setTimeout(x))});
+  S.res={res,n,seed,bad,deck:{leader:d.leader,cards:{...d.cards}}};out.innerHTML=statHTML(S.res)}catch(e){out.textContent="Errore: "+(e.message||e)}}
+const cardRows=a=>a.map(c=>`<tr><td>${stNm(c.id)} <span class="mu">${c.id}</span></td><td>${c.g}</td><td>${pc(c.wr1)}</td><td>${pc(c.wr0)}</td><td class="${c.d>=0?"o":"e"}">${pp(c.d)}</td></tr>`).join("")||'<tr><td colspan="5" class="mu">Campione insufficiente (servono ≥30 partite con e senza la carta).</td></tr>';
+function statHTML(R){const{res,n,seed,bad,deck}=R,p=score(res),se=scoreSE(res),w=wts(res);let af=0,aw=0,sf=0,sw=0;
+ for(const x of res){af+=x.s.a_first.games;aw+=x.s.a_first.wins;sf+=x.s.a_second.games;sw+=x.s.a_second.wins}
+ const cs=contrib(res.map(x=>x.r)).filter(c=>c.id in deck.cards),hd="<tr><th>Carta</th><th>Partite in cui è stata vista</th><th>Win con</th><th>Win senza</th><th>Δ</th></tr>",
+ worst=[...res].sort((a,b)=>a.s.winrate_a-b.s.winrate_a).slice(0,3);
+ return(bad.length?`<p class="w"><b>PARZIALE – NON ATTENDIBILE:</b> effetti non simulati per ${bad.length} carte (${esc(bad.slice(0,12).join(", "))}).</p>`:"")+
+ `<table><tr><td>Win rate pesato sul Meta (IC 95% appross.)</td><td><b>${pc(p)} ± ${pc(1.96*se)}</b></td></tr><tr><td>Partite simulate</td><td>${res.length*n} (${n} per matchup) · seed ${seed} · motore ${ENGINE_VERSION}</td></tr><tr><td>Per primo</td><td>${pc(aw/Math.max(af,1))} (${af} partite)</td></tr><tr><td>Per secondo</td><td>${pc(sw/Math.max(sf,1))} (${sf} partite)</td></tr></table>
+ <h4>Per avversario</h4><div class="wrap"><table><tr><th>Avversario</th><th>Leader</th><th>Peso</th><th>Win rate [IC 95%]</th><th>Per primo</th><th>Per secondo</th><th>Turni</th></tr>${res.map((x,i)=>{const s=x.s;return`<tr><td>${esc(x.o.name)}</td><td>${x.o.leader}</td><td>${(100*w[i]).toFixed(0)}%</td><td>${ci(s.wins_a,n)}</td><td>${pc(s.a_first.wins/Math.max(s.a_first.games,1))}</td><td>${pc(s.a_second.wins/Math.max(s.a_second.games,1))}</td><td>${s.avg_turns.toFixed(1)}</td></tr>`}).join("")}</table></div>
+ <h4>Carte con Δ più alto</h4><div class="wrap"><table>${hd}${cardRows(cs.slice(0,8))}</table></div><h4>Carte con Δ più basso</h4><div class="wrap"><table>${hd}${cardRows(cs.slice(-8).reverse())}</table></div>
+ <p class="mu">Δ = win rate nelle partite in cui la carta è stata vista (mano iniziale o pescata) meno quello delle partite in cui non è mai comparsa. È una <b>stima correlazionale</b>, non un effetto causale.</p>
+ <h4>Matchup peggiori</h4>${worst.map(x=>{const c=contrib([x.r]).filter(k=>k.id in deck.cards).slice(-3).reverse();return`<div class="card"><b>${esc(x.o.name)}</b> (${x.o.leader}) · ${ci(x.s.wins_a,n)}<br><span class="mu">${c.length?"Carte più deboli in questo matchup (stima): "+c.map(k=>`${stNm(k.id)} ${pp(k.d)}`).join(", ")+". Candidate da sostituire: verificalo con Ottimizzazione AI, dando più peso a questo avversario nel Meta.":"Campione insufficiente per indicare carte."}</span></div>`}).join("")}
+ <p class="mu">Etichetta: SIMULAZIONE${bad.length?" (parziale)":""}. Riproducibile con lo stesso seed.</p>`}
+function optView(){return`<div class="card"><h3>Ottimizzazione AI</h3><p class="mu">Ricerca locale: a ogni ciclo prova sostituzioni di 1 copia (una fuori tra le carte più deboli, una dentro tra Character/Event legali, implementati e compatibili col Leader). Accetta una modifica solo se migliora il win rate pesato sul Meta sul campione di ricerca <b>e</b> su un secondo campione indipendente; il risultato finale è misurato su partite ancora diverse. Il rumore statistico con poche partite è alto: leggi gli intervalli.</p>
+<div class="row"><label>Mazzo <select id="od">${deckOpts(1)}</select></label><label>Partite/matchup <select id="on"><option>200</option><option selected>400</option><option>1000</option></select></label><label>Cicli <select id="or"><option>3</option><option selected>5</option><option>10</option></select></label><label>Candidati/ciclo <select id="ok"><option>6</option><option selected>10</option><option>20</option></select></label><label>Seed <input id="ox" type="number" value="1" style="width:80px"></label><label><input type="checkbox" id="op"> Consenti parziale (NON attendibile)</label><button class="b p" onclick="runOpt()">Ottimizza</button><button class="b" onclick="S.stop=true">Ferma</button></div><div id="oprog" class="mu"></div></div><div id="oout">${S.opt?optHTML(S.opt):""}</div>`}
+async function runOpt(){const d=getDeck($("#od").value),out=$("#oout"),pg=$("#oprog"),bad=prep(d,$("#op").checked,out);if(!bad)return;
+ const le=legalDeck(S.cards,S.ban,d.leader,d.cards);if(le.length)return alert("Il mazzo di partenza non è legale: "+le.slice(0,4).join("; "));
+ S.stop=false;const o={n:+$("#on").value,rounds:+$("#or").value,k:+$("#ok").value,seed:+$("#ox").value||1,reset:()=>{S.stop=false}},t0=performance.now();
+ try{const R=await optimize(S.cards,S.ban,d,S.meta,o,async()=>{if(S.stop)throw"stop";await new Promise(x=>setTimeout(x))},m=>{pg.textContent=m});
+  R.bad=bad;R.deck={leader:d.leader,cards:{...d.cards}};R.sec=(performance.now()-t0)/1000;S.opt=R;pg.textContent="Completato.";out.innerHTML=optHTML(R)}
+ catch(e){pg.textContent=e==="stop"?"Interrotto.":"Errore: "+(e.message||e)}}
+function optHTML(R){const{orig,opt,moves,final,deck,bad}=R,f=(rs)=>`${pc(score(rs))} ± ${pc(1.96*scoreSE(rs))}`,
+ ks=[...new Set([...Object.keys(deck.cards),...Object.keys(final)])].sort().filter(k=>(deck.cards[k]||0)!==(final[k]||0));
+ return(bad.length?`<div class="card w"><b>PARZIALE – NON ATTENDIBILE:</b> ${bad.length} carte con effetti non simulati.</div>`:"")+
+ `<div class="card"><h4>Risultato · ${R.hn} partite per matchup, seed ${R.seed} (indipendenti da quelli di ricerca)</h4><table><tr><td>Originale</td><td><b>${f(orig.rs)}</b></td></tr><tr><td>Ottimizzata</td><td><b>${f(opt.rs)}</b></td></tr></table>
+ <p class="mu">Win rate medio pesato sul Meta, IC 95% approssimato. ${moves.length?"Se gli intervalli si sovrappongono, il miglioramento non è dimostrato.":"Nessuna modifica ha superato la validazione: lista già ottimo locale a questa risoluzione; aumenta partite o cicli."} Tempo ${R.sec.toFixed(0)}s. Etichetta: SIMULAZIONE.</p>
+ <div class="wrap"><table><tr><th>Avversario</th><th>Originale</th><th>Ottimizzata</th></tr>${orig.rs.map((x,i)=>`<tr><td>${esc(x.o.name)}</td><td>${ci(x.s.wins_a,x.s.n)}</td><td>${ci(opt.rs[i].s.wins_a,opt.rs[i].s.n)}</td></tr>`).join("")}</table></div></div>
+ <div class="card"><h4>Modifiche accettate</h4>${moves.map(m=>`<div>Ciclo ${m.round}: −1 ${stNm(m.out)} → +1 ${stNm(m.inn)} <span class="mu">· ricerca ${pc(m.before)}→${pc(m.after)} · conferma ${pc(m.vb)}→${pc(m.va)}</span></div>`).join("")||'<span class="mu">Nessuna.</span>'}
+ ${ks.length?`<table>${ks.map(k=>`<tr><td>${stNm(k)} <span class="mu">${k}</span></td><td>${deck.cards[k]||0}</td><td>→</td><td>${final[k]||0}</td></tr>`).join("")}</table><div class="row"><button class="b p" onclick="optSave()">Salva come versione</button><button class="b" onclick="optLoad()">Apri nel Deck Builder</button></div>`:""}</div>`}
+function optSave(){const n=prompt("Nome versione ottimizzata:","ottimizzato");if(!n)return;S.saved[n]={leader:S.opt.deck.leader,cards:{...S.opt.final},at:new Date().toISOString()};sv("decks",S.saved);alert("Salvato.")}
+function optLoad(){S.leader=S.opt.deck.leader;S.main={...S.opt.final};S.tab="build";render()}
+render();
+</script></body></html>
